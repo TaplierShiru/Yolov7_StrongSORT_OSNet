@@ -102,6 +102,27 @@ python track.py --source ... --save-txt
 ```
 
 
+## Export model for other backends
+
+Further as example `osnet_x0_25_msmt17.pt` model will be used, but it could be swapped to other [ReID models](https://kaiyangzhou.github.io/deep-person-reid/MODEL_ZOO).
+
+### ONNX, TFLite and OpenVINO
+
+In the folder of this repo type next command:
+```bash
+python reid_export.py --weights=./osnet_x0_25_msmt17.pt
+```
+This command will produce model for certain backend (if its installed)
+
+### TensorRT
+
+To generate TensorRT model - ONNX model can be used. From previous command we get `osnet_x0_25_msmt17.onnx` which we will use further to generate `.trt` model. In the folder of this repo type next commands:
+```bash
+git clone https://github.com/Linaom1214/tensorrt-python.git
+cd tensorrt-python
+python export.py -o ./../osnet_x0_25_msmt17.onnx -e ./../osnet_x0_25_msmt17.trt -p fp16
+```
+
 ## Cite
 
 If you find this project useful in your research, please consider cite:

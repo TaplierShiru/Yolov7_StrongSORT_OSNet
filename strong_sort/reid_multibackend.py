@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch
 from pathlib import Path
+from collections import OrderedDict,namedtuple
 import numpy as np
 import torchvision.transforms as transforms
 import cv2
@@ -29,7 +30,7 @@ class ReIDDetectMultiBackend(nn.Module):
     def __init__(self, weights='osnet_x0_25_msmt17.pt', device=torch.device('cpu'), fp16=False):
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
-        self.pt, self.jit, self.onnx, self.xml, self.engine, self.coreml, \
+        self.pt, self.jit, self.onnx, self.xml, self.engine, self.trt, self.coreml, \
             self.saved_model, self.pb, self.tflite, self.edgetpu, self.tfjs = self.model_type(w)  # get backend
         
         if self.pt:  # PyTorch
@@ -81,6 +82,27 @@ class ReIDDetectMultiBackend(nn.Module):
             # The function `get_tensor()` returns a copy of the tensor data.
             output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
             print(output_data.shape)
+        elif self.trt:
+            import tensorrt as trt
+            # Infer TensorRT Engine
+            Binding = namedtuple('Binding', ('name', 'dtype', 'shape', 'data', 'ptr'))
+            logger = trt.Logger(trt.Logger.INFO)
+            trt.init_libnvinfer_plugins(logger, namespace="")
+            with open(w, 'rb') as f, trt.Runtime(logger) as runtime:
+                model = runtime.deserialize_cuda_engine(f.read())
+            self.bindings = OrderedDict()
+            for index in range(model.num_bindings):
+                name = model.get_binding_name(index)
+                dtype = trt.nptype(model.get_binding_dtype(index))
+                shape = tuple(model.get_binding_shape(index))
+                data = torch.from_numpy(np.empty(shape, dtype=np.dtype(dtype))).to(device)
+                self.bindings[name] = Binding(name, dtype, shape, data, int(data.data_ptr()))
+            self.binding_addrs = OrderedDict((n, d.ptr) for n, d in self.bindings.items())
+            self.context = model.create_execution_context()
+            if fp16:
+                print('Fp16 with TensorRT does not work as entented at current time.\n' +\ 
+                      'Matrix in the tracker will be broken and model could not track.'
+                )
         else:
             print('This model framework is not supported yet!')
             exit()
@@ -103,6 +125,7 @@ class ReIDDetectMultiBackend(nn.Module):
             ['ONNX', 'onnx', '.onnx', True, True],
             ['OpenVINO', 'openvino', '_openvino_model', True, False],
             ['TensorRT', 'engine', '.engine', False, True],
+            ['TensorRT', 'trt', '.trt', False, True],
             ['CoreML', 'coreml', '.mlmodel', True, False],
             ['TensorFlow SavedModel', 'saved_model', '_saved_model', True, True],
             ['TensorFlow GraphDef', 'pb', '.pb', True, True],
@@ -118,10 +141,10 @@ class ReIDDetectMultiBackend(nn.Module):
         suffixes = list(self.export_formats().Suffix) + ['.xml']  # export suffixes
         check_suffix(p, suffixes)  # checks
         p = Path(p).name  # eliminate trailing separators
-        pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, xml2 = (s in p for s in suffixes)
+        pt, jit, onnx, xml, engine, trt, coreml, saved_model, pb, tflite, edgetpu, tfjs, xml2 = (s in p for s in suffixes)
         xml |= xml2  # *_openvino_model or *.xml
         tflite &= not edgetpu  # *.tflite
-        return pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs
+        return pt, jit, onnx, xml, engine, trt, coreml, saved_model, pb, tflite, edgetpu, tfjs
     
     def warmup(self, imgsz=(1, 256, 128, 3)):
         # Warmup model by running inference once
@@ -159,6 +182,13 @@ class ReIDDetectMultiBackend(nn.Module):
             elif self.xml:  # OpenVINO
                 im = im.cpu().numpy()  # FP32
                 y = self.executable_network([im])[self.output_layer]
+            elif self.trt:
+                # TODO: If use fp16 when matrix in tracker will be broken and does not work as entened
+                #       But, if your model is fp16 compiled and input will be float32 - its okey and will work
+                #       Need to investigate why matrix are broken if im has float16 type...
+                self.binding_addrs['images'] = int(im.data_ptr())
+                self.context.execute_v2(list(self.binding_addrs.values()))
+                y = self.bindings['output'].data
             else:  # TensorFlow (SavedModel, GraphDef, Lite, Edge TPU)
                 im = im.permute(0, 3, 2, 1).cpu().numpy()  # torch BCHW to numpy BHWC shape(1,320,192,3)
                 input, output = self.input_details[0], self.output_details[0]
